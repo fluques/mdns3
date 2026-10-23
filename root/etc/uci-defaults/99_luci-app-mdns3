@@ -1,0 +1,51 @@
+#!/bin/sh
+
+logger -t MDNS3_INIT "Starting uci-defaults initialization script..."
+
+# 1. Dynamically obtain the current LAN interface IP address (without CIDR /24 suffix and taking only the first IP if it is a list)
+ROUTER_LAN_IP=$(uci -q get network.lan.ipaddr | awk '{print $1}' | cut -d'/' -f1)
+
+# Fallback to a safe default if the IP is empty
+if [ -z "$ROUTER_LAN_IP" ]; then
+    ROUTER_LAN_IP="192.168.1.1"
+fi
+
+logger -t MDNS3_INIT "Detected local router IP: $ROUTER_LAN_IP"
+
+# 2. Ensure the persistent directory in flash storage exists
+mkdir -p /etc/mdns3.d
+chmod 755 /etc/mdns3.d
+
+# 3. Record initial application switch state (if not already present)
+if [ ! -f /etc/config/dhcp.mode ]; then
+    if [ -n "$(uci -q get dhcp.@dnsmasq[0].confdir)" ]; then
+        echo "on" > /etc/config/dhcp.mode
+    else
+        echo "off" > /etc/config/dhcp.mode
+    fi
+    chmod 644 /etc/config/dhcp.mode
+fi
+
+# 4. Generate mdns3_servers.conf in the persistent directory
+cat << EOF > /etc/mdns3.d/mdns3_servers.conf
+dhcp-option=tag:cloudflare_dns,6,1.1.1.1
+dhcp-option=tag:google_dns,6,8.8.8.8
+dhcp-option=tag:local_dns,6,${ROUTER_LAN_IP}
+EOF
+chmod 644 /etc/mdns3.d/mdns3_servers.conf
+
+# 5. Create empty rules file in the persistent directory if it does not exist
+if [ ! -f /etc/mdns3.d/mdns3_rules.conf ]; then
+    touch /etc/mdns3.d/mdns3_rules.conf
+    chmod 644 /etc/mdns3.d/mdns3_rules.conf
+fi
+
+logger -t MDNS3_INIT ".conf files successfully generated in persistent storage (/etc/mdns3.d)."
+
+# 6. Clean up any leftover temporary /tmp confdir setting in UCI
+if [ "$(uci -q get dhcp.@dnsmasq[0].confdir)" = "/tmp/mdns3.d" ]; then
+    uci revert dhcp
+    logger -t MDNS3_INIT "Cleaned up previous temporary confdir setting."
+fi
+
+exit 0

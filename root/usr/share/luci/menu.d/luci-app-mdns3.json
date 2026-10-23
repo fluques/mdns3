@@ -1,0 +1,13 @@
+{
+	"admin/network/mdns3": {
+		"title": "mDns3",
+		"order": 90,
+		"action": {
+			"type": "view",
+			"path": "mdns3"
+		},
+		"depends": {
+			"acl": [ "luci-app-mdns3" ]
+		}
+	}
+}
