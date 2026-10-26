@@ -2,28 +2,26 @@
 	"luci-app-mdns3": {
 		"description": "Grant access to mdns3 configuration and service restart",
 		"read": {
-			"uci": [ "dhcp" ],
+			"uci": [ "dhcp", "firewall" ],
 			"file": {
 				"/etc/mdns3.d/*": [ "read" ],
-				"/etc/config/dhcp": [ "read" ],
-				"/etc/config/dhcp.bak": [ "read" ],
-				"/etc/config/dhcp.mode": [ "read" ]
+				"/etc/config/dhcp.mode": [ "read" ],
+				"/etc/config/firewall": [ "read" ]
 			},
 			"menu": {
 				"admin/network/mdns3": [ "read" ]
 			}
 		},
 		"write": {
-			"uci": [ "dhcp" ],
+			"uci": [ "firewall" ],
 			"file": {
 				"/etc/mdns3.d/*": [ "write" ],
-				"/etc/config/dhcp": [ "write" ],
-				"/etc/config/dhcp.bak": [ "write", "delete" ],
-				"/etc/config/dhcp.mode": [ "write", "delete" ]
+				"/etc/config/dhcp.mode": [ "write", "delete" ],
+				"/etc/config/firewall": [ "write" ]
 			},
 			"ubus": {
 				"system": [ "init_action" ],
-				"uci": [ "add", "change", "set", "remove" ]
+				"uci": [ "add", "change", "set", "remove", "commit", "apply" ]
 			}
 		}
 	}

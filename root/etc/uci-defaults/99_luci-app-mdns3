@@ -18,16 +18,24 @@ chmod 755 /etc/mdns3.d
 
 # 3. Record initial application switch state (if not already present)
 if [ ! -f /etc/config/dhcp.mode ]; then
-    if [ -n "$(uci -q get dhcp.@dnsmasq[0].confdir)" ]; then
-        echo "on" > /etc/config/dhcp.mode
-    else
-        echo "off" > /etc/config/dhcp.mode
-    fi
+    echo "off" > /etc/config/dhcp.mode
     chmod 644 /etc/config/dhcp.mode
 fi
 
 # 4. Generate mdns3_servers.conf in the persistent directory
 cat << EOF > /etc/mdns3.d/mdns3_servers.conf
+# DoH Canary domains (signal browsers/OS to disable DoH and fall back to port 53)
+address=/use-application-dns.net/
+address=/_dns.resolver.arpa/
+address=/mask.icloud.com/
+address=/mask-h2.icloud.com/
+address=/dns.google/
+address=/cloudflare-dns.com/
+address=/one.one.one.one/
+address=/dns.quad9.net/
+address=/doh.opendns.com/
+address=/dns.adguard-dns.com/
+address=/dns.nextdns.io/
 dhcp-option=tag:cloudflare_dns,6,1.1.1.1
 dhcp-option=tag:google_dns,6,8.8.8.8
 dhcp-option=tag:local_dns,6,${ROUTER_LAN_IP}
@@ -42,10 +50,12 @@ fi
 
 logger -t MDNS3_INIT ".conf files successfully generated in persistent storage (/etc/mdns3.d)."
 
-# 6. Clean up any leftover temporary /tmp confdir setting in UCI
-if [ "$(uci -q get dhcp.@dnsmasq[0].confdir)" = "/tmp/mdns3.d" ]; then
-    uci revert dhcp
-    logger -t MDNS3_INIT "Cleaned up previous temporary confdir setting."
+# 6. Clear LuCI caches, bump LuCI resource version so browsers fetch the new JS, and reload rpcd
+rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache* /tmp/luci-sessions* 2>/dev/null
+if [ -f /www/luci-static/resources/luci.js ]; then
+    touch /www/luci-static/resources/luci.js 2>/dev/null || true
 fi
+/etc/init.d/rpcd reload 2>/dev/null || /etc/init.d/rpcd restart 2>/dev/null || true
+/etc/init.d/uhttpd reload 2>/dev/null || /etc/init.d/uhttpd restart 2>/dev/null || true
 
 exit 0

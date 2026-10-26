@@ -22,7 +22,52 @@ return L.view.extend({
 			if (octet > 255) return null;
 			n = n * 256 + octet;
 		}
-		return n;
+		return n >>> 0;
+	},
+
+	// Convert unsigned 32-bit integer back to "a.b.c.d"
+	intToIp: function(n) {
+		return [
+			(n >>> 24) & 255,
+			(n >>> 16) & 255,
+			(n >>> 8) & 255,
+			n & 255
+		].join('.');
+	},
+
+	// Decompose an inclusive IPv4 range [startIp, endIp] into the minimal list of CIDR blocks (supported by fw3, fw4, and LuCI)
+	rangeToCidrs: function(startIp, endIp) {
+		var self = this;
+		var start = self.ipToInt(startIp);
+		var end = self.ipToInt(endIp);
+		if (start === null || end === null || start > end)
+			return [];
+
+		var cidrs = [];
+		var cur = start >>> 0;
+		var max = end >>> 0;
+
+		while (cur <= max) {
+			var maxSize = 32;
+			while (maxSize > 0) {
+				var mask = maxSize === 0 ? 0 : ((0xFFFFFFFF << (32 - (maxSize - 1))) >>> 0);
+				if (((cur & mask) >>> 0) !== cur)
+					break;
+				maxSize--;
+			}
+
+			var remaining = (max - cur + 1);
+			var maxDiff = 32 - Math.floor(Math.log(remaining) / Math.log(2));
+			var prefix = Math.max(maxSize, maxDiff);
+
+			cidrs.push(self.intToIp(cur) + (prefix === 32 ? '' : '/' + prefix));
+
+			var blockSize = Math.pow(2, 32 - prefix);
+			if (cur + blockSize > 0xFFFFFFFF)
+				break;
+			cur = (cur + blockSize) >>> 0;
+		}
+		return cidrs;
 	},
 
 	// Detect inverted ranges (start > end) and overlaps between rules on the same VLAN
@@ -75,17 +120,15 @@ return L.view.extend({
 		return L.require('fs').then(function(fs_module) {
 			self.fs = fs_module;
 
-			// 1. Read switch state (on / off) and sync with actual dnsmasq configuration
-			return L.resolveDefault(self.fs.read('/etc/config/dhcp.mode'), '').then(function(modeContent) {
-				// 2. Always load standard /etc/config/dhcp file
-				return L.uci.load('dhcp').then(function() {
-					var sections = L.uci.sections('dhcp', 'dnsmasq');
-					if (sections.length > 0 && sections[0].confdir) {
-						self.isAppEnabled = true;
-						self.currentConfDir = sections[0].confdir;
-					} else {
-						self.isAppEnabled = (modeContent.trim() === 'on');
-					}
+			// 1. Read switch state (on / off)
+			return L.resolveDefault(self.fs.read('/etc/config/dhcp.mode'), 'off').then(function(modeContent) {
+				self.isAppEnabled = (modeContent.trim() === 'on');
+
+				// 2. Load /etc/config/dhcp (read-only for VLAN list) and /etc/config/firewall
+				return Promise.all([
+					L.uci.load('dhcp'),
+					L.uci.load('firewall')
+				]).then(function() {
 					
 					var pathServers = self.currentConfDir + '/' + self.targetFile;
 					var pathRules = self.currentConfDir + '/' + self.rulesFile;
@@ -161,11 +204,8 @@ return L.view.extend({
 		var modeButtonText = self.isAppEnabled ? _('TURN OFF') : _('TURN ON');
 		var modeAlertClass = self.isAppEnabled ? 'alert-message success' : 'alert-message warning';
 		var modeDescriptionText = self.isAppEnabled 
-			? _('Application ENABLED (ON): dnsmasq uses confdir %s and start/limit/leasetime were removed from available DHCP interfaces.').format(self.currentConfDir) 
+			? _('Application ENABLED (ON). You can edit DNS tags, DHCP range rules, and firewall redirect rules.') 
 			: _('Application DISABLED (OFF). Interface in READ-ONLY mode. Enable the application to make changes.');
-
-		// Default OpenWrt values restored when turning the application off
-		var DHCP_DEFAULTS = { start: '100', limit: '150', leasetime: '12h' };
 
 		var btnToggleMode = E('button', {
 			'class': self.isAppEnabled ? 'btn cbi-button-reset' : 'btn cbi-button-apply',
@@ -175,39 +215,26 @@ return L.view.extend({
 
 				var enable = !self.isAppEnabled;
 
-				// 1. confdir on main dnsmasq section
-				var dnsmasqSections = L.uci.sections('dhcp', 'dnsmasq');
-				if (dnsmasqSections.length > 0) {
-					var mainDnsmasqName = dnsmasqSections[0]['.name'];
-					if (enable)
-						L.uci.set('dhcp', mainDnsmasqName, 'confdir', self.currentConfDir);
-					else
-						L.uci.unset('dhcp', mainDnsmasqName, 'confdir');
-				}
+				// 1. Remove or recreate mDNS3 firewall redirect rules when toggling ON/OFF
+				self.syncFirewallRedirects(enable);
 
-				// 2. start / limit / leasetime on available DHCP interfaces (same filter as VLAN list)
-				L.uci.sections('dhcp', 'dhcp').forEach(function(s) {
-					if (!s.interface || s.ignore === '1')
-						return;
-
-					Object.keys(DHCP_DEFAULTS).forEach(function(opt) {
-						if (enable)
-							L.uci.unset('dhcp', s['.name'], opt);
-						else
-							L.uci.set('dhcp', s['.name'], opt, DHCP_DEFAULTS[opt]);
-					});
-				});
-
-				// 3. Save mode state, save UCI changes and apply them (commit + dnsmasq reload via procd)
+				// 2. Save mode state, commit firewall changes and restart firewall (never touches /etc/config/dhcp)
 				return L.require('ui').then(function(ui) {
 					return self.fs.write('/etc/config/dhcp.mode', enable ? 'on' : 'off').then(function() {
 						return L.uci.save();
 					}).then(function() {
-						return L.uci.changes();
-					}).then(function(changes) {
-						if (changes && Object.keys(changes).length > 0)
-							return ui.changes.apply(true);
-
+						return L.require('rpc').then(function(rpc_module) {
+							var callUciCommit = rpc_module.declare({
+								object: 'uci', method: 'commit', params: [ 'config' ]
+							});
+							var callInitAction = rpc_module.declare({
+								object: 'system', method: 'init_action', params: [ 'name', 'action' ], expect: { 'result': 0 }
+							});
+							return L.resolveDefault(callUciCommit('firewall'), null).then(function() {
+								return L.resolveDefault(callInitAction('firewall', 'restart'), '');
+							});
+						});
+					}).then(function() {
 						window.location.reload();
 					}).catch(function(err) {
 						ui.addNotification(null, E('p', {}, _('Error changing application state: ') + (err.message || err)), 'error');
@@ -586,7 +613,7 @@ return L.view.extend({
 			E('div', { 'id': 'cbi-map-dhcp-container' })
 		]);
 
-		var m = new L.form.Map('dhcp', _('mDNS3'), _('Tag-based DHCP / DNS Server Configuration'));
+		var m = new L.form.Map('dhcp', _('mDNS3 (v1.2-r1)'), _('Tag-based DHCP / DNS Server Configuration with DoT/DoH Leak Protection'));
 		
 		// Disable bottom native LuCI buttons when app is OFF
 		if (!self.isAppEnabled) {
@@ -610,15 +637,144 @@ return L.view.extend({
 		return containerViewForm;
 	},
 
-	handleSaveApply: function(ev, mode) {
+	// Resolve the firewall zone name covering a logical network interface (e.g. 'lan')
+	getZoneForNetwork: function(netName) {
+		var zones = L.uci.sections('firewall', 'zone');
+		for (var i = 0; i < zones.length; i++) {
+			var nets = zones[i].network;
+			if (Array.isArray(nets) && nets.indexOf(netName) !== -1)
+				return zones[i].name || netName;
+			if (typeof nets === 'string' && nets.split(/\s+/).indexOf(netName) !== -1)
+				return zones[i].name || netName;
+		}
+		return netName || 'lan';
+	},
+
+	// Synchronize (create / update / delete) mDNS3 DNS redirect and DoT/DoH anti-leak rules in /etc/config/firewall (UCI staging)
+	syncFirewallRedirects: function(active) {
 		var self = this;
-		
-		// Extra safeguard at save level
+
+		// 1. Remove existing mDNS3-managed redirect and rule sections
+		var existingRedirects = L.uci.sections('firewall', 'redirect');
+		existingRedirects.forEach(function(sec) {
+			if (sec['.name'].indexOf('mdns3_') === 0 || (sec.name && sec.name.indexOf('mDNS3_') === 0)) {
+				L.uci.remove('firewall', sec['.name']);
+			}
+		});
+
+		var existingRules = L.uci.sections('firewall', 'rule');
+		existingRules.forEach(function(sec) {
+			if (sec['.name'].indexOf('mdns3_') === 0 || (sec.name && sec.name.indexOf('mDNS3_') === 0)) {
+				L.uci.remove('firewall', sec['.name']);
+			}
+		});
+
+		if (!active)
+			return;
+
+		// Map each tag to its configured DNS server IP
+		var tagToDns = {};
+		self.parsedOptions.forEach(function(opt) {
+			var t = (opt.tag || '').trim();
+			var d = (opt.dns || '').trim();
+			if (t && d) tagToDns[t] = d;
+		});
+
+		// Common public DoH/DoQ resolver IPs blocked on port 443 TCP/UDP so clients fall back to port 53 DNAT
+		var dohResolverIps = [
+			'1.1.1.1', '1.0.0.1', '1.1.1.2', '1.0.0.2', '1.1.1.3', '1.0.0.3',
+			'8.8.8.8', '8.8.4.4',
+			'9.9.9.9', '149.112.112.112',
+			'208.67.222.222', '208.67.220.220',
+			'94.140.14.14', '94.140.15.15',
+			'185.228.168.9', '185.228.169.9',
+			'76.76.2.0', '76.76.10.0'
+		];
+
+		// 2. Create firewall redirect rules per row in parsedRules (decomposing start_ip-end_ip into minimal CIDRs)
+		var ruleCounter = 1;
+		var activeZones = [];
+
+		self.parsedRules.forEach(function(rule, idx) {
+			if (!rule.vlan || !rule.tag || !rule.start_ip || !rule.end_ip)
+				return;
+
+			var dnsIp = tagToDns[rule.tag];
+			if (!dnsIp)
+				return;
+
+			var cidrs = self.rangeToCidrs(rule.start_ip, rule.end_ip);
+			var zone = self.getZoneForNetwork(rule.vlan);
+			if (activeZones.indexOf(zone) === -1)
+				activeZones.push(zone);
+
+			cidrs.forEach(function(cidr, cIdx) {
+				var num = ruleCounter++;
+				var sid = 'mdns3_rule_' + num;
+				var suffix = cidrs.length > 1 ? '_' + (idx + 1) + '_' + (cIdx + 1) : '_' + (idx + 1);
+
+				// 2a. Port 53 (TCP/UDP) DNAT redirect to tag's DNS server
+				L.uci.add('firewall', 'redirect', sid);
+				L.uci.set('firewall', sid, 'name', 'mDNS3_' + rule.vlan + '_' + rule.tag + suffix);
+				L.uci.set('firewall', sid, 'target', 'DNAT');
+				L.uci.set('firewall', sid, 'src', zone);
+				L.uci.set('firewall', sid, 'src_ip', cidr);
+				L.uci.set('firewall', sid, 'src_dport', '53');
+				L.uci.set('firewall', sid, 'proto', 'tcp udp');
+				L.uci.set('firewall', sid, 'dest_ip', dnsIp);
+				L.uci.set('firewall', sid, 'dest_port', '53');
+				L.uci.set('firewall', sid, 'family', 'ipv4');
+				L.uci.set('firewall', sid, 'reflection', '0');
+
+				// 2b. Block DoT (port 853 TCP/UDP) for this CIDR range so clients fall back to port 53
+				var dotSid = 'mdns3_dot_' + num;
+				L.uci.add('firewall', 'rule', dotSid);
+				L.uci.set('firewall', dotSid, 'name', 'mDNS3_Block_DoT_' + rule.vlan + suffix);
+				L.uci.set('firewall', dotSid, 'src', zone);
+				L.uci.set('firewall', dotSid, 'dest', '*');
+				L.uci.set('firewall', dotSid, 'src_ip', cidr);
+				L.uci.set('firewall', dotSid, 'proto', 'tcp udp');
+				L.uci.set('firewall', dotSid, 'dest_port', '853');
+				L.uci.set('firewall', dotSid, 'family', 'ipv4');
+				L.uci.set('firewall', dotSid, 'target', 'REJECT');
+
+				// 2c. Block DoH / DoQ (port 443 TCP/UDP) to known public DNS resolvers for this CIDR range
+				var dohSid = 'mdns3_doh_' + num;
+				L.uci.add('firewall', 'rule', dohSid);
+				L.uci.set('firewall', dohSid, 'name', 'mDNS3_Block_DoH_' + rule.vlan + suffix);
+				L.uci.set('firewall', dohSid, 'src', zone);
+				L.uci.set('firewall', dohSid, 'dest', '*');
+				L.uci.set('firewall', dohSid, 'src_ip', cidr);
+				L.uci.set('firewall', dohSid, 'dest_ip', dohResolverIps);
+				L.uci.set('firewall', dohSid, 'proto', 'tcp udp');
+				L.uci.set('firewall', dohSid, 'dest_port', '443');
+				L.uci.set('firewall', dohSid, 'family', 'ipv4');
+				L.uci.set('firewall', dohSid, 'target', 'REJECT');
+			});
+		});
+
+		// 3. Block IPv6 DNS (ports 53 and 853) on active zones to prevent IPv6 DNS leaks bypassing IPv4 DNAT
+		activeZones.forEach(function(zone, zIdx) {
+			var v6Sid = 'mdns3_ipv6_dns_' + (zIdx + 1);
+			L.uci.add('firewall', 'rule', v6Sid);
+			L.uci.set('firewall', v6Sid, 'name', 'mDNS3_Block_IPv6_DNS_' + zone);
+			L.uci.set('firewall', v6Sid, 'src', zone);
+			L.uci.set('firewall', v6Sid, 'dest', '*');
+			L.uci.set('firewall', v6Sid, 'family', 'ipv6');
+			L.uci.set('firewall', v6Sid, 'proto', 'tcp udp');
+			L.uci.set('firewall', v6Sid, 'dest_port', '53 853');
+			L.uci.set('firewall', v6Sid, 'target', 'REJECT');
+		});
+	},
+
+	// Validate inputs, write mdns3_servers.conf & mdns3_rules.conf, and stage firewall rules in UCI
+	saveConfiguration: function() {
+		var self = this;
+
 		if (!self.isAppEnabled) {
 			return Promise.reject(new Error(_('Saving configuration is not allowed while the application is disabled.')));
 		}
 
-		// Do not save if there are invalid DNS Server IPs or invalid/overlapping ranges in Rules
 		var validationErrors = [];
 		self.parsedOptions.forEach(function(opt, idx) {
 			if (self.ipToInt(opt.dns) === null) {
@@ -632,19 +788,30 @@ return L.view.extend({
 			return L.require('ui').then(function(ui) {
 				ui.addNotification(_('Changes were not saved'),
 					E('div', {}, validationErrors.map(function(msg) { return E('p', {}, msg); })), 'error');
+				return false;
 			});
 		}
 
 		var pathServers = self.currentConfDir + '/' + self.targetFile;
 		var pathRules = self.currentConfDir + '/' + self.rulesFile;
 
-		var serversContent = '';
+		var serversContent = '# DoH Canary domains (signal browsers/OS to disable DoH and fall back to port 53)\n'
+			+ 'address=/use-application-dns.net/\n'
+			+ 'address=/_dns.resolver.arpa/\n'
+			+ 'address=/mask.icloud.com/\n'
+			+ 'address=/mask-h2.icloud.com/\n'
+			+ 'address=/dns.google/\n'
+			+ 'address=/cloudflare-dns.com/\n'
+			+ 'address=/one.one.one.one/\n'
+			+ 'address=/dns.quad9.net/\n'
+			+ 'address=/doh.opendns.com/\n'
+			+ 'address=/dns.adguard-dns.com/\n'
+			+ 'address=/dns.nextdns.io/\n';
+
 		self.parsedOptions.forEach(function(opt) {
 			if (opt.tag && opt.dns) serversContent += 'dhcp-option=tag:' + opt.tag + ',6,' + opt.dns + '\n';
 		});
 
-		// Rules are saved ONLY in mdns3_rules.conf (dnsmasq reads them via confdir).
-		// /etc/config/dhcp is not modified here; only the ON/OFF button modifies it.
 		var rulesContent = '';
 		self.parsedRules.forEach(function(rule) {
 			if (rule.vlan && rule.tag && rule.start_ip && rule.end_ip && rule.netmask && rule.leasetime) {
@@ -653,24 +820,65 @@ return L.view.extend({
 			}
 		});
 
+		// Stage updated firewall redirect rules in UCI
+		self.syncFirewallRedirects(true);
+
 		return Promise.all([
 			self.fs.write(pathServers, serversContent),
-			self.fs.write(pathRules, rulesContent)
+			self.fs.write(pathRules, rulesContent),
+			L.uci.save()
 		]).then(function() {
-			// Restart dnsmasq so it re-reads confdir files (without UCI commit)
+			return true;
+		});
+	},
+
+	handleSave: function(ev) {
+		var self = this;
+		return self.saveConfiguration().then(function(saved) {
+			if (!saved) return;
+			return L.require('ui').then(function(ui) {
+				if (ui.changes && typeof ui.changes.init === 'function')
+					ui.changes.init();
+				ui.addNotification(null, E('p', {}, _('Changes saved. Click "Save & Apply" to commit firewall rules and restart services.')), 'info');
+			});
+		}).catch(function(err) {
+			return L.require('ui').then(function(ui) {
+				ui.addNotification(null, E('p', {}, _('Error saving configuration: ') + (err.message || err)), 'error');
+			});
+		});
+	},
+
+	handleSaveApply: function(ev, mode) {
+		var self = this;
+		return self.saveConfiguration().then(function(saved) {
+			if (!saved) return;
+
 			return L.require('rpc').then(function(rpc_module) {
+				var callUciCommit = rpc_module.declare({
+					object: 'uci', method: 'commit', params: [ 'config' ]
+				});
 				var callInitAction = rpc_module.declare({
 					object: 'system', method: 'init_action', params: [ 'name', 'action' ], expect: { 'result': 0 }
 				});
-				return L.resolveDefault(callInitAction('dnsmasq', 'restart'), '');
+
+				// 1. Commit firewall changes to /etc/config/firewall
+				return L.resolveDefault(callUciCommit('firewall'), null).then(function() {
+					// 2. Restart dnsmasq and firewall
+					return Promise.all([
+						L.resolveDefault(callInitAction('dnsmasq', 'restart'), ''),
+						L.resolveDefault(callInitAction('firewall', 'restart'), '')
+					]);
+				});
 			}).then(function() {
-				L.require('ui').then(function(ui) {
-					ui.addNotification(null, E('p', {}, _('Changes saved and applied successfully.')), 'info');
+				return L.require('ui').then(function(ui) {
+					if (ui.changes && typeof ui.changes.init === 'function')
+						ui.changes.init();
+					ui.addNotification(null, E('p', {}, _('Changes saved, committed, and dnsmasq + firewall restarted successfully.')), 'info');
 				});
 			});
 		}).catch(function(err) {
-			L.require('ui').then(function(ui) {
-				ui.addNotification(null, E('p', {}, _('Error saving network configuration: ') + err.message), 'error');
+			return L.require('ui').then(function(ui) {
+				ui.addNotification(null, E('p', {}, _('Error applying network configuration: ') + (err.message || err)), 'error');
 			});
 		});
 	}

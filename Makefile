@@ -1,8 +1,8 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-mdns3
-PKG_VERSION:=1.0
-PKG_RELEASE:=2
+PKG_VERSION:=1.2
+PKG_RELEASE:=1
 
 include $(INCLUDE_DIR)/package.mk
 
@@ -35,6 +35,15 @@ define Package/luci-app-mdns3/install
 	# 4. Install rpcd ACL permission files
 	$(INSTALL_DIR) $(1)/usr/share/rpcd/acl.d
 	$(CP) ./root/usr/share/rpcd/acl.d/* $(1)/usr/share/rpcd/acl.d/
+endef
+
+define Package/luci-app-mdns3/postinst
+#!/bin/sh
+if [ -z "$${IPKG_INSTROOT}" ]; then
+	rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache* /tmp/luci-sessions* 2>/dev/null
+	/etc/init.d/rpcd reload 2>/dev/null || /etc/init.d/rpcd restart 2>/dev/null
+fi
+exit 0
 endef
 
 $(eval $(call BuildPackage,luci-app-mdns3))
